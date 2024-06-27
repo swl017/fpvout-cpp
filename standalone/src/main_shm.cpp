@@ -15,6 +15,13 @@
 #include <opencv2/opencv.hpp>
 #include <chrono>
 #include <thread>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
+}
+#define INBUF_SIZE 4096
 
 using namespace std;
 using namespace cv;
@@ -24,6 +31,103 @@ using namespace cv;
 #define FRAME_WIDTH 640   // Adjust these values according to your video format
 #define FRAME_HEIGHT 480
 #define MAX_RETRIES 5
+struct DecoderContext {
+    const AVCodec *codec;
+    AVCodecParserContext *parser;
+    AVCodecContext *c;
+    AVFrame *frame;
+    AVPacket *pkt;
+    SwsContext *sws_ctx;
+};
+
+DecoderContext* init_decoder() {
+    DecoderContext* ctx = new DecoderContext();
+
+    ctx->codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!ctx->codec) {
+        std::cerr << "Codec not found" << std::endl;
+        return nullptr;
+    }
+
+    ctx->parser = av_parser_init(ctx->codec->id);
+    if (!ctx->parser) {
+        std::cerr << "Parser not found" << std::endl;
+        return nullptr;
+    }
+
+    ctx->c = avcodec_alloc_context3(ctx->codec);
+    if (!ctx->c) {
+        std::cerr << "Could not allocate video codec context" << std::endl;
+        return nullptr;
+    }
+
+    if (avcodec_open2(ctx->c, ctx->codec, NULL) < 0) {
+        std::cerr << "Could not open codec" << std::endl;
+        return nullptr;
+    }
+
+    ctx->frame = av_frame_alloc();
+    ctx->pkt = av_packet_alloc();
+
+    return ctx;
+}
+
+void decode(DecoderContext* ctx, uint8_t* data, int data_size) {
+    uint8_t *ptr = data;
+    while (data_size > 0) {
+        int ret = av_parser_parse2(ctx->parser, ctx->c, &ctx->pkt->data, &ctx->pkt->size,
+                                   ptr, data_size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+        if (ret < 0) {
+            std::cerr << "Error while parsing" << std::endl;
+            return;
+        }
+        ptr += ret;
+        data_size -= ret;
+
+        if (ctx->pkt->size) {
+            int send_ret = avcodec_send_packet(ctx->c, ctx->pkt);
+            if (send_ret < 0) {
+                std::cerr << "Error sending packet for decoding" << std::endl;
+                return;
+            }
+
+            while (send_ret >= 0) {
+                int receive_ret = avcodec_receive_frame(ctx->c, ctx->frame);
+                if (receive_ret == AVERROR(EAGAIN) || receive_ret == AVERROR_EOF)
+                    break;
+                else if (receive_ret < 0) {
+                    std::cerr << "Error during decoding" << std::endl;
+                    return;
+                }
+
+                // Convert the frame to BGR format for OpenCV
+                if (!ctx->sws_ctx) {
+                    ctx->sws_ctx = sws_getContext(ctx->c->width, ctx->c->height, ctx->c->pix_fmt,
+                                                  ctx->c->width, ctx->c->height, AV_PIX_FMT_BGR24,
+                                                  SWS_BILINEAR, NULL, NULL, NULL);
+                }
+
+                cv::Mat frame(ctx->c->height, ctx->c->width, CV_8UC3);
+                uint8_t *dest[4] = {frame.data, NULL, NULL, NULL};
+                int dest_linesize[4] = {frame.step, 0, 0, 0};
+                sws_scale(ctx->sws_ctx, ctx->frame->data, ctx->frame->linesize, 0, ctx->c->height, dest, dest_linesize);
+
+                // Display the frame
+                cv::imshow("Decoded Frame", frame);
+                cv::waitKey(1);
+            }
+        }
+    }
+}
+
+void close_decoder(DecoderContext* ctx) {
+    av_parser_close(ctx->parser);
+    avcodec_free_context(&ctx->c);
+    av_frame_free(&ctx->frame);
+    av_packet_free(&ctx->pkt);
+    sws_freeContext(ctx->sws_ctx);
+    delete ctx;
+}
 
 double now() {
     struct timeb timebuffer;
@@ -34,11 +138,12 @@ double now() {
 int die(string msg, int code) { cerr << msg << code << endl; return code; }
 
 libusb_device_handle* open_device() {
+    int err = 0;
     libusb_device_handle *dh = libusb_open_device_with_vid_pid(NULL, 0x2ca3, 0x001f);
     if (dh) {
-        if (libusb_claim_interface(dh, 3) < 0) {
+        if ((err = libusb_claim_interface(dh, 3)) < 0) {
             libusb_close(dh);
-            return NULL;
+            die("claim interface fail ", err);
         }
         
         int tx = 0;
@@ -91,8 +196,21 @@ int main() {
         size_t shm_offset;
         Mat frame;
         chrono::steady_clock::time_point last_packet;
+        DecoderContext* decoder_ctx;  
     };
-    ctx myctx = {now(), 0, shm_ptr, 0, Mat(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC3), chrono::steady_clock::now()};
+    DecoderContext* decoder_ctx = init_decoder();
+    if (!decoder_ctx) {
+        return -1;
+    }
+    ctx myctx = {
+        now(),
+        0,
+        shm_ptr,
+        0,
+        Mat(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC3),
+        chrono::steady_clock::now(),
+        decoder_ctx
+    };
 
     libusb_device_handle* dh = NULL;
     struct libusb_transfer *xfr = NULL;
@@ -108,6 +226,9 @@ int main() {
 
         c->last_packet = chrono::steady_clock::now();
 
+        // Decode the received data
+        decode(c->decoder_ctx, xfer->buffer, xfer->actual_length);
+
         // Copy received data to shared memory
         if (c->shm_offset + xfer->actual_length > SHM_SIZE) {
             c->shm_offset = 0;  // Wrap around if we reach the end of the shared memory
@@ -115,12 +236,15 @@ int main() {
         memcpy((char*)c->shm_ptr + c->shm_offset, xfer->buffer, xfer->actual_length);
         c->shm_offset += xfer->actual_length;
 
-        // Update OpenCV frame
-        memcpy(c->frame.data, xfer->buffer, min(xfer->actual_length, (int)(FRAME_WIDTH * FRAME_HEIGHT * 3)));
+        // // Assume the data is in YUV422 format (common for video devices)
+        // cv::Mat yuv(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC2, xfer->buffer);
+        // cv::Mat bgr;
+        // cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_YUYV);
 
-        // Display the frame
-        imshow("Debug Output", c->frame);
-        waitKey(1);  // This allows the GUI to update
+        // // Output the decoded frame
+        // cv::imshow("Debug Output", bgr);
+
+        // cv::waitKey(1);  // This allows the GUI to update
 
         if ((now() - c->last) > (c->bytes? 0.1 : 2)) {
             cerr << "rx " << (c->bytes / (now() - c->last))/1000 << " kb/s" << endl;
@@ -134,7 +258,6 @@ int main() {
             cerr << "Failed to resubmit transfer" << endl;
         }
     };
-
     while(1) {
         if (!dh) {
             cerr << "Opening device" << endl;
