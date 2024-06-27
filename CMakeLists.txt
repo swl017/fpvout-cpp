@@ -1,24 +1,26 @@
-cmake_minimum_required(VERSION 3.1.0)
-project(fpvLiberator)
+find_package(catkin REQUIRED COMPONENTS
+  roscpp
+  sensor_msgs
+  cv_bridge
+)
 
-include(FindPkgConfig)
-pkg_check_modules(libusb REQUIRED IMPORTED_TARGET libusb-1.0)
 find_package(OpenCV REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 
-include(CTest)
-enable_testing()
+catkin_package()
 
-set(CMAKE_CXX_STANDARD 11)
+include_directories(
+  ${catkin_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
+  ${LIBUSB_INCLUDE_DIRS}
+)
 
-file(GLOB SOURCES "src/*.cpp")
-file(GLOB HEADERS "src/*.h")
-
-add_executable(${PROJECT_NAME} src/main.cpp ${HEADERS})
-add_executable(${PROJECT_NAME}_pipe src/main_pipe.cpp ${HEADERS})
-add_executable(${PROJECT_NAME}_shm src/main_pipe.cpp ${HEADERS})
-
-target_link_libraries(${PROJECT_NAME} PkgConfig::libusb)
-target_link_libraries(${PROJECT_NAME}_pipe PkgConfig::libusb pthread)
-target_link_libraries(${PROJECT_NAME}_shm PkgConfig::libusb pthread rt ${OpenCV_LIBS})
-
-target_include_directories(${PROJECT_NAME}_pipe PRIVATE ${OpenCV_INCLUDE_DIRS})
+add_executable(fpv_liberator_node src/fpv_liberator_node.cpp src/fpv_liberator.cpp)
+target_link_libraries(fpv_liberator_node
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+  ${LIBUSB_LIBRARIES}
+  rt
+  pthread
+)

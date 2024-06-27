@@ -65,7 +65,21 @@ int main() {
         return die("initialize fail ", err);
 
     // Create shared memory and set up ffplay (same as before)
-    // ...
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        return die("Failed to create shared memory ", errno);
+    }
+
+    // Configure the size of the shared memory object
+    if (ftruncate(shm_fd, SHM_SIZE) == -1) {
+        return die("Failed to configure shared memory size ", errno);
+    }
+
+    // Map the shared memory object into this process's memory space
+    void* shm_ptr = mmap(0, SHM_SIZE, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+        return die("Failed to map shared memory ", errno);
+    }
 
     // Create OpenCV window for debug output
     namedWindow("Debug Output", WINDOW_NORMAL);
@@ -142,8 +156,11 @@ int main() {
                 continue;
             }
         }
-
-        if (libusb_handle_events_timeout_completed(NULL, &(struct timeval){0, 100000}) != LIBUSB_SUCCESS) {
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+        int completed = 0;
+        if (libusb_handle_events_timeout_completed(NULL, &tv, &completed) != LIBUSB_SUCCESS) {
             cerr << "Error in event handling" << endl;
             close_device(dh);
             dh = NULL;
