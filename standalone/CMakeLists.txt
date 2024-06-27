@@ -40,8 +40,8 @@ target_include_directories(fpv_liberator_lib PRIVATE ${OpenCV_INCLUDE_DIRS} ${CM
 target_link_libraries(${PROJECT_NAME} PkgConfig::libusb)
 target_link_libraries(${PROJECT_NAME}_pipe PkgConfig::libusb pthread)
 target_link_libraries(${PROJECT_NAME}_shm PkgConfig::libusb PkgConfig::LIBAV pthread rt ${OpenCV_LIBS} ${AVCODEC_LIBRARY} ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY})
-target_link_libraries(${PROJECT_NAME}_classimpl fpv_liberator_lib PkgConfig::libusb pthread rt ${OpenCV_LIBS})
+target_link_libraries(${PROJECT_NAME}_classimpl PkgConfig::libusb PkgConfig::LIBAV pthread rt ${OpenCV_LIBS} ${AVCODEC_LIBRARY} ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY})
 
 target_include_directories(${PROJECT_NAME}_pipe PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_include_directories(${PROJECT_NAME}_shm PRIVATE ${OpenCV_INCLUDE_DIRS} ${AVCODEC_INCLUDE_DIR} ${AVFORMAT_INCLUDE_DIR} ${AVUTIL_INCLUDE_DIR})
-target_include_directories(${PROJECT_NAME}_classimpl PRIVATE ${OpenCV_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_include_directories(${PROJECT_NAME}_classimpl PRIVATE ${OpenCV_INCLUDE_DIRS} ${AVCODEC_INCLUDE_DIR} ${AVFORMAT_INCLUDE_DIR} ${AVUTIL_INCLUDE_DIR})
