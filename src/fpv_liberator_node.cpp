@@ -18,6 +18,9 @@
 #include <opencv2/opencv.hpp>
 #include <chrono>
 #include <thread>
+#include <atomic>
+#include <signal.h>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -25,17 +28,19 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
-using namespace std;
-using namespace cv;
-
+#define INBUF_SIZE 4096
 #define SHM_NAME "/fpv_liberator_shm"
 #define SHM_SIZE 1048576  // 1MB shared memory size
-#define FRAME_WIDTH 1280   // Adjust these values according to your video format
-#define FRAME_HEIGHT 720
+#define FRAME_WIDTH 640   // Adjust these values according to your video format
+#define FRAME_HEIGHT 480
 #define MAX_RETRIES 5
-#define INBUF_SIZE 4096
 
 class FPVLiberator {
+public:
+    FPVLiberator(ros::NodeHandle& nh);
+    ~FPVLiberator();
+    void run();
+
 private:
     struct DecoderContext {
         const AVCodec *codec;
@@ -46,99 +51,190 @@ private:
         SwsContext *sws_ctx;
     };
 
-    struct ctx {
-        double last;
-        int bytes;
-        void* shm_ptr;
-        size_t shm_offset;
-        Mat frame;
-        chrono::steady_clock::time_point last_packet;
-        DecoderContext* decoder_ctx;  
-    };
+    ros::NodeHandle& nh_;
+    ros::Publisher image_pub_;
+    libusb_device_handle* dh_;
+    struct libusb_transfer *xfr_;
+    DecoderContext* decoder_ctx_;
+    void* shm_ptr_;
+    int shm_fd_;
+    std::vector<uint8_t> buf_;
+    std::atomic<bool> should_run_;
 
-    ctx myctx;
-    libusb_device_handle* dh;
-    struct libusb_transfer *xfr;
-    vector<uint8_t> buf;
-    int shm_fd;
-
-    // ROS-specific members
-    ros::NodeHandle nh;
-    ros::Publisher image_pub;
+    double last_;
+    int bytes_;
+    size_t shm_offset_;
+    cv::Mat frame_;
+    std::chrono::steady_clock::time_point last_packet_;
 
     DecoderContext* init_decoder();
-    void decode(DecoderContext* ctx, uint8_t* data, int data_size);
     void close_decoder(DecoderContext* ctx);
+    void decode(DecoderContext* ctx, uint8_t* data, int data_size);
     double now();
-    int die(string msg, int code);
     libusb_device_handle* open_device();
-    void close_device(libusb_device_handle* dh);
+    void close_device();
     static void transfer_cb(struct libusb_transfer *xfer);
-    void publish_frame(const cv::Mat& frame);
-
-public:
-    FPVLiberator(int argc, char** argv);
-    ~FPVLiberator();
-    int run();
+    void handle_transfer(struct libusb_transfer *xfer);
+    void cleanup();
 };
 
-FPVLiberator::FPVLiberator(int argc, char** argv) : dh(NULL), xfr(NULL), buf(65536) {
-    // Initialize ROS
-    ros::init(argc, argv, "fpv_liberator");
-    image_pub = nh.advertise<sensor_msgs::Image>("fpv_image", 1);
+FPVLiberator::FPVLiberator(ros::NodeHandle& nh) 
+    : nh_(nh), dh_(nullptr), xfr_(nullptr), decoder_ctx_(nullptr), shm_ptr_(nullptr), shm_fd_(-1),
+      buf_(65536), should_run_(true), last_(0), bytes_(0), shm_offset_(0),
+      frame_(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC3), last_packet_(std::chrono::steady_clock::now()) {
+    
+    image_pub_ = nh_.advertise<sensor_msgs::Image>("fpv_image", 1);
 
-    cerr << "Using libusb v" << libusb_get_version()->major << "." << libusb_get_version()->minor << "." << libusb_get_version()->micro << endl;
-    int err = 0;
-    cerr << "initializing" << endl;
-    if ((err = libusb_init(NULL)) < 0)
-        die("initialize fail ", err);
-
-    shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-    if (shm_fd == -1) {
-        die("Failed to create shared memory ", errno);
+    ROS_INFO("Initializing libusb");
+    if (libusb_init(NULL) < 0) {
+        ROS_ERROR("Failed to initialize libusb");
+        ros::shutdown();
+        return;
     }
 
-    if (ftruncate(shm_fd, SHM_SIZE) == -1) {
-        die("Failed to configure shared memory size ", errno);
+    ROS_INFO("Creating shared memory");
+    shm_fd_ = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd_ == -1) {
+        ROS_ERROR("Failed to create shared memory: %s", strerror(errno));
+        ros::shutdown();
+        return;
     }
 
-    void* shm_ptr = mmap(0, SHM_SIZE, PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (shm_ptr == MAP_FAILED) {
-        die("Failed to map shared memory ", errno);
+    if (ftruncate(shm_fd_, SHM_SIZE) == -1) {
+        ROS_ERROR("Failed to configure shared memory size: %s", strerror(errno));
+        cleanup();
+        ros::shutdown();
+        return;
     }
 
-    namedWindow("Debug Output", WINDOW_NORMAL);
-
-    DecoderContext* decoder_ctx = init_decoder();
-    if (!decoder_ctx) {
-        die("Failed to initialize decoder", -1);
+    shm_ptr_ = mmap(0, SHM_SIZE, PROT_WRITE, MAP_SHARED, shm_fd_, 0);
+    if (shm_ptr_ == MAP_FAILED) {
+        ROS_ERROR("Failed to map shared memory: %s", strerror(errno));
+        cleanup();
+        ros::shutdown();
+        return;
     }
 
-    myctx = {
-        now(),
-        0,
-        shm_ptr,
-        0,
-        Mat(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC3),
-        chrono::steady_clock::now(),
-        decoder_ctx
-    };
+    decoder_ctx_ = init_decoder();
+    if (!decoder_ctx_) {
+        ROS_ERROR("Failed to initialize decoder");
+        cleanup();
+        ros::shutdown();
+        return;
+    }
+
+    last_ = now();
 }
 
 FPVLiberator::~FPVLiberator() {
-    cerr << "closing" << endl;
-    if (dh) close_device(dh);
-    libusb_exit(NULL);
-
-    munmap(myctx.shm_ptr, SHM_SIZE);
-    close(shm_fd);
-    shm_unlink(SHM_NAME);
-
-    destroyAllWindows();
-    close_decoder(myctx.decoder_ctx);
+    cleanup();
 }
 
-// ... (other methods remain the same)
+void FPVLiberator::cleanup() {
+    ROS_INFO("Cleaning up resources");
+    if (dh_) close_device();
+    if (decoder_ctx_) close_decoder(decoder_ctx_);
+    if (shm_ptr_ != MAP_FAILED) munmap(shm_ptr_, SHM_SIZE);
+    if (shm_fd_ != -1) {
+        close(shm_fd_);
+        shm_unlink(SHM_NAME);
+    }
+    libusb_exit(NULL);
+}
+
+void FPVLiberator::run() {
+    while (ros::ok() && should_run_) {
+        if (!dh_) {
+            ROS_INFO("Opening device");
+            dh_ = open_device();
+            if (!dh_) {
+                ROS_WARN("Failed to open device, retrying in 5 seconds...");
+                ros::Duration(5.0).sleep();
+                continue;
+            }
+
+            if (xfr_) libusb_free_transfer(xfr_);
+            xfr_ = libusb_alloc_transfer(0);
+            libusb_fill_bulk_transfer(xfr_, dh_, 0x84, buf_.data(), buf_.size(), transfer_cb, this, 1000);
+            
+            if (libusb_submit_transfer(xfr_) < 0) {
+                ROS_ERROR("Failed to submit initial transfer");
+                close_device();
+                continue;
+            }
+        }
+
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+        int completed = 0;
+        if (libusb_handle_events_timeout_completed(NULL, &tv, &completed) != LIBUSB_SUCCESS) {
+            ROS_ERROR("Error in event handling");
+            close_device();
+            continue;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_packet_).count() > 5) {
+            ROS_WARN("No packets received for 5 seconds, reconnecting...");
+            close_device();
+            continue;
+        }
+
+        ros::spinOnce();
+    }
+}
+
+FPVLiberator::DecoderContext* FPVLiberator::init_decoder() {
+    DecoderContext* ctx = new DecoderContext();
+
+    ctx->codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!ctx->codec) {
+        ROS_ERROR("Codec not found");
+        delete ctx;
+        return nullptr;
+    }
+
+    ctx->parser = av_parser_init(ctx->codec->id);
+    if (!ctx->parser) {
+        ROS_ERROR("Parser not found");
+        delete ctx;
+        return nullptr;
+    }
+
+    ctx->c = avcodec_alloc_context3(ctx->codec);
+    if (!ctx->c) {
+        ROS_ERROR("Could not allocate video codec context");
+        av_parser_close(ctx->parser);
+        delete ctx;
+        return nullptr;
+    }
+
+    if (avcodec_open2(ctx->c, ctx->codec, NULL) < 0) {
+        ROS_ERROR("Could not open codec");
+        avcodec_free_context(&ctx->c);
+        av_parser_close(ctx->parser);
+        delete ctx;
+        return nullptr;
+    }
+
+    ctx->frame = av_frame_alloc();
+    ctx->pkt = av_packet_alloc();
+    ctx->sws_ctx = nullptr;
+
+    return ctx;
+}
+
+void FPVLiberator::close_decoder(DecoderContext* ctx) {
+    if (ctx) {
+        av_parser_close(ctx->parser);
+        avcodec_free_context(&ctx->c);
+        av_frame_free(&ctx->frame);
+        av_packet_free(&ctx->pkt);
+        sws_freeContext(ctx->sws_ctx);
+        delete ctx;
+    }
+}
 
 void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
     uint8_t *ptr = data;
@@ -146,7 +242,7 @@ void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
         int ret = av_parser_parse2(ctx->parser, ctx->c, &ctx->pkt->data, &ctx->pkt->size,
                                    ptr, data_size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
         if (ret < 0) {
-            std::cerr << "Error while parsing" << std::endl;
+            ROS_ERROR("Error while parsing");
             return;
         }
         ptr += ret;
@@ -155,7 +251,7 @@ void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
         if (ctx->pkt->size) {
             int send_ret = avcodec_send_packet(ctx->c, ctx->pkt);
             if (send_ret < 0) {
-                std::cerr << "Error sending packet for decoding" << std::endl;
+                ROS_ERROR("Error sending packet for decoding");
                 return;
             }
 
@@ -164,7 +260,7 @@ void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
                 if (receive_ret == AVERROR(EAGAIN) || receive_ret == AVERROR_EOF)
                     break;
                 else if (receive_ret < 0) {
-                    std::cerr << "Error during decoding" << std::endl;
+                    ROS_ERROR("Error during decoding");
                     return;
                 }
 
@@ -179,101 +275,91 @@ void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
                 int dest_linesize[4] = {frame.step, 0, 0, 0};
                 sws_scale(ctx->sws_ctx, ctx->frame->data, ctx->frame->linesize, 0, ctx->c->height, dest, dest_linesize);
 
-                cv::imshow("Decoded Frame", frame);
-                cv::waitKey(1);
-
-                // Publish the frame as a ROS message
-                publish_frame(frame);
+                sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", frame).toImageMsg();
+                image_pub_.publish(msg);
             }
         }
     }
 }
 
-void FPVLiberator::publish_frame(const cv::Mat& frame) {
-    sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", frame).toImageMsg();
-    image_pub.publish(msg);
+double FPVLiberator::now() {
+    struct timeb timebuffer;
+    ftime(&timebuffer);
+    return timebuffer.time + ((double)timebuffer.millitm)/1000;
+}
+
+libusb_device_handle* FPVLiberator::open_device() {
+    libusb_device_handle *dh = libusb_open_device_with_vid_pid(NULL, 0x2ca3, 0x001f);
+    if (dh) {
+        if (libusb_claim_interface(dh, 3) < 0) {
+            ROS_ERROR("Failed to claim interface");
+            libusb_close(dh);
+            return nullptr;
+        }
+        
+        int tx = 0;
+        uint8_t data[] = {0x52, 0x4d, 0x56, 0x54};
+        if (libusb_bulk_transfer(dh, 0x03, data, 4, &tx, 500) < 0) {
+            ROS_WARN("No data transmitted to device");
+        }
+    }
+    return dh;
+}
+
+void FPVLiberator::close_device() {
+    if (dh_) {
+        libusb_release_interface(dh_, 3);
+        libusb_close(dh_);
+        dh_ = nullptr;
+    }
 }
 
 void FPVLiberator::transfer_cb(struct libusb_transfer *xfer) {
-    ctx* c = (ctx*) xfer->user_data;
-    
+    FPVLiberator* liberator = static_cast<FPVLiberator*>(xfer->user_data);
+    liberator->handle_transfer(xfer);
+}
+
+void FPVLiberator::handle_transfer(struct libusb_transfer *xfer) {
     if (xfer->status != LIBUSB_TRANSFER_COMPLETED) {
-        cerr << "Transfer failed: " << libusb_error_name(xfer->status) << endl;
+        ROS_ERROR("Transfer failed: %s", libusb_error_name(xfer->status));
         return;
     }
 
-    c->last_packet = chrono::steady_clock::now();
+    last_packet_ = std::chrono::steady_clock::now();
 
-    FPVLiberator* liberator = static_cast<FPVLiberator*>(c->decoder_ctx->c->opaque);
-    liberator->decode(c->decoder_ctx, xfer->buffer, xfer->actual_length);
+    decode(decoder_ctx_, xfer->buffer, xfer->actual_length);
 
-    if (c->shm_offset + xfer->actual_length > SHM_SIZE) {
-        c->shm_offset = 0;
+    if (shm_offset_ + xfer->actual_length > SHM_SIZE) {
+        shm_offset_ = 0;
     }
-    memcpy((char*)c->shm_ptr + c->shm_offset, xfer->buffer, xfer->actual_length);
-    c->shm_offset += xfer->actual_length;
+    memcpy((char*)shm_ptr_ + shm_offset_, xfer->buffer, xfer->actual_length);
+    shm_offset_ += xfer->actual_length;
 
-    if ((liberator->now() - c->last) > (c->bytes? 0.1 : 2)) {
-        cerr << "rx " << (c->bytes / (liberator->now() - c->last))/1000 << " kb/s" << endl;
-        c->last = liberator->now();
-        c->bytes = 0;
+    if ((now() - last_) > (bytes_ ? 0.1 : 2)) {
+        ROS_INFO("Receiving %f kb/s", (bytes_ / (now() - last_))/1000);
+        last_ = now();
+        bytes_ = 0;
     }
-    c->bytes += xfer->actual_length;
+    bytes_ += xfer->actual_length;
 
     if (libusb_submit_transfer(xfer) < 0) {
-        cerr << "Failed to resubmit transfer" << endl;
+        ROS_ERROR("Failed to resubmit transfer");
     }
 }
 
-int FPVLiberator::run() {
-    while(ros::ok()) {
-        if (!dh) {
-            cerr << "Opening device" << endl;
-            dh = open_device();
-            if (!dh) {
-                cerr << "Failed to open device, retrying in 5 seconds..." << endl;
-                this_thread::sleep_for(chrono::seconds(5));
-                continue;
-            }
+void signal_handler(int signum) {
+    ROS_INFO("Interrupt signal (%d) received.", signum);
+    ros::shutdown();
+}
 
-            if (xfr) libusb_free_transfer(xfr);
-            xfr = libusb_alloc_transfer(0);
-            libusb_fill_bulk_transfer(xfr, dh, 0x84, buf.data(), buf.size(), transfer_cb, &myctx, 1000);
-            
-            if (libusb_submit_transfer(xfr) < 0) {
-                cerr << "Failed to submit initial transfer" << endl;
-                close_device(dh);
-                dh = NULL;
-                continue;
-            }
-        }
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000;
-        int completed = 0;
-        if (libusb_handle_events_timeout_completed(NULL, &tv, &completed) != LIBUSB_SUCCESS) {
-            cerr << "Error in event handling" << endl;
-            close_device(dh);
-            dh = NULL;
-            continue;
-        }
+int main(int argc, char **argv) {
+    ros::init(argc, argv, "fpv_liberator");
+    ros::NodeHandle nh;
 
-        auto now = chrono::steady_clock::now();
-        if (chrono::duration_cast<chrono::seconds>(now - myctx.last_packet).count() > 5) {
-            cerr << "No packets received for 5 seconds, reconnecting..." << endl;
-            close_device(dh);
-            dh = NULL;
-            continue;
-        }
+    signal(SIGINT, signal_handler);
 
-        ros::spinOnce();
+    FPVLiberator liberator(nh);
+    liberator.run();
 
-        if (waitKey(1) == 27) break;  // Exit if ESC is pressed
-    }
     return 0;
-}
-
-int main(int argc, char** argv) {
-    FPVLiberator liberator(argc, argv);
-    return liberator.run();
 }
