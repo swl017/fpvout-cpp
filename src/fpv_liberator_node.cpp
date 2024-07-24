@@ -1,5 +1,8 @@
 #include <ros/ros.h>
+#include <image_transport/image_transport.h>
 #include <sensor_msgs/Image.h>
+#include <sensor_msgs/CameraInfo.h>
+#include <sensor_msgs/CompressedImage.h>
 #include <cv_bridge/cv_bridge.h>
 #include <iostream>
 #include <string>
@@ -52,7 +55,10 @@ private:
     };
 
     ros::NodeHandle& nh_;
-    ros::Publisher image_pub_;
+    image_transport::ImageTransport it_;
+    image_transport::Publisher image_pub_;
+    image_transport::Publisher compressed_pub_;
+    ros::Publisher camera_info_pub_;
     libusb_device_handle* dh_;
     struct libusb_transfer *xfr_;
     DecoderContext* decoder_ctx_;
@@ -66,6 +72,7 @@ private:
     size_t shm_offset_;
     cv::Mat frame_;
     std::chrono::steady_clock::time_point last_packet_;
+    sensor_msgs::CameraInfo camera_info_;
 
     DecoderContext* init_decoder();
     void close_decoder(DecoderContext* ctx);
@@ -76,14 +83,19 @@ private:
     static void transfer_cb(struct libusb_transfer *xfer);
     void handle_transfer(struct libusb_transfer *xfer);
     void cleanup();
+    void setup_camera_info();
+    void publish_frame(const cv::Mat& frame);
 };
 
 FPVLiberator::FPVLiberator(ros::NodeHandle& nh) 
-    : nh_(nh), dh_(nullptr), xfr_(nullptr), decoder_ctx_(nullptr), shm_ptr_(nullptr), shm_fd_(-1),
+    : nh_(nh), it_(nh), dh_(nullptr), xfr_(nullptr), decoder_ctx_(nullptr), shm_ptr_(nullptr), shm_fd_(-1),
       buf_(65536), should_run_(true), last_(0), bytes_(0), shm_offset_(0),
       frame_(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC3), last_packet_(std::chrono::steady_clock::now()) {
     
-    image_pub_ = nh_.advertise<sensor_msgs::Image>("fpv_image", 1);
+    image_pub_ = it_.advertise("fpv_image", 1);
+    camera_info_pub_ = nh_.advertise<sensor_msgs::CameraInfo>("fpv_camera_info", 1);
+
+    setup_camera_info();
 
     ROS_INFO("Initializing libusb");
     if (libusb_init(NULL) < 0) {
@@ -128,6 +140,34 @@ FPVLiberator::FPVLiberator(ros::NodeHandle& nh)
 
 FPVLiberator::~FPVLiberator() {
     cleanup();
+}
+
+void FPVLiberator::setup_camera_info() {
+    camera_info_.header.frame_id = "fpv_camera";
+    camera_info_.width = FRAME_WIDTH;
+    camera_info_.height = FRAME_HEIGHT;
+    
+    // Set the camera matrix, distortion coefficients, and other parameters
+    // These are placeholder values - you should replace them with actual calibration data
+    camera_info_.K = {500.0, 0.0, FRAME_WIDTH/2.0, 0.0, 500.0, FRAME_HEIGHT/2.0, 0.0, 0.0, 1.0};
+    camera_info_.D = {0.0, 0.0, 0.0, 0.0, 0.0};
+    camera_info_.R = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+    camera_info_.P = {500.0, 0.0, FRAME_WIDTH/2.0, 0.0, 0.0, 500.0, FRAME_HEIGHT/2.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+    
+    camera_info_.distortion_model = "plumb_bob";
+}
+
+void FPVLiberator::publish_frame(const cv::Mat& frame) {
+    ros::Time now = ros::Time::now();
+
+    // Publish the raw image
+    sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", frame).toImageMsg();
+    msg->header.stamp = now;
+    msg->header.frame_id = "fpv_camera";
+    image_pub_.publish(msg);
+
+    camera_info_.header.stamp = now;
+    camera_info_pub_.publish(camera_info_);
 }
 
 void FPVLiberator::cleanup() {
@@ -275,8 +315,7 @@ void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
                 int dest_linesize[4] = {frame.step, 0, 0, 0};
                 sws_scale(ctx->sws_ctx, ctx->frame->data, ctx->frame->linesize, 0, ctx->c->height, dest, dest_linesize);
 
-                sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", frame).toImageMsg();
-                image_pub_.publish(msg);
+                publish_frame(frame);
             }
         }
     }
@@ -353,7 +392,7 @@ void signal_handler(int signum) {
 }
 
 int main(int argc, char **argv) {
-    ros::init(argc, argv, "fpv_liberator");
+    ros::init(argc, argv, "fpvout");
     ros::NodeHandle nh;
 
     signal(SIGINT, signal_handler);
