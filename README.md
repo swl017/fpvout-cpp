@@ -3,7 +3,7 @@ Get Live Video from DJI HD FPV Goggles. C++ version!
 
 ## Compiling from source
 
-Builds using [Cmake](https://cmake.org/download/) for easy compilation on any system. 
+Build using [Cmake](https://cmake.org/download/) for easy compilation on any system. 
 
 ## Dependencies
 - `libusb`
