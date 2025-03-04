@@ -20,7 +20,7 @@ Build using [Cmake](https://cmake.org/download/) for easy compilation on any sys
 ```
 sudo ./fpvLiberator_shm
 ```
-
+or
 ```
 ./fpvLiberator | ffplay -i - -analyzeduration 1 -probesize 32 -sync ext
 ```
