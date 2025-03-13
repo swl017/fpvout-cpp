@@ -1,6 +1,8 @@
 #include "fpvout.h"
 
 int main() {
-    FPVLiberator liberator;
-    return liberator.run();
+    int width = 1280;
+    int height = 720;
+    FPVout fpvout(width, height);
+    return fpvout.run();
 }

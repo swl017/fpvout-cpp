@@ -1,6 +1,6 @@
 #include "fpvout.h"
 
-FPVLiberator::FPVLiberator() : dh(NULL), xfr(NULL), buf(65536) {
+FPVout::FPVout(int width, int height) : dh(NULL), xfr(NULL), buf(65536), width_(width), height_(height) {
     cerr << "Using libusb v" << libusb_get_version()->major << "." << libusb_get_version()->minor << "." << libusb_get_version()->micro << endl;
     int err = 0;
     cerr << "initializing" << endl;
@@ -33,13 +33,13 @@ FPVLiberator::FPVLiberator() : dh(NULL), xfr(NULL), buf(65536) {
         0,
         shm_ptr,
         0,
-        Mat(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC3),
+        Mat(height_, width_, CV_8UC3),
         chrono::steady_clock::now(),
         decoder_ctx
     };
 }
 
-FPVLiberator::~FPVLiberator() {
+FPVout::~FPVout() {
     cerr << "closing" << endl;
     if (dh) close_device(dh);
     libusb_exit(NULL);
@@ -52,7 +52,7 @@ FPVLiberator::~FPVLiberator() {
     close_decoder(myctx.decoder_ctx);
 }
 
-FPVLiberator::DecoderContext* FPVLiberator::init_decoder() {
+FPVout::DecoderContext* FPVout::init_decoder() {
     DecoderContext* ctx = new DecoderContext();
 
     ctx->codec = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -84,7 +84,7 @@ FPVLiberator::DecoderContext* FPVLiberator::init_decoder() {
     return ctx;
 }
 
-void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
+void FPVout::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
     uint8_t *ptr = data;
     while (data_size > 0) {
         int ret = av_parser_parse2(ctx->parser, ctx->c, &ctx->pkt->data, &ctx->pkt->size,
@@ -130,7 +130,7 @@ void FPVLiberator::decode(DecoderContext* ctx, uint8_t* data, int data_size) {
     }
 }
 
-void FPVLiberator::close_decoder(DecoderContext* ctx) {
+void FPVout::close_decoder(DecoderContext* ctx) {
     av_parser_close(ctx->parser);
     avcodec_free_context(&ctx->c);
     av_frame_free(&ctx->frame);
@@ -139,18 +139,18 @@ void FPVLiberator::close_decoder(DecoderContext* ctx) {
     delete ctx;
 }
 
-double FPVLiberator::now() {
+double FPVout::now() {
     struct timeb timebuffer;
     ftime(&timebuffer);
     return timebuffer.time + ((double)timebuffer.millitm)/1000;
 }
 
-int FPVLiberator::die(string msg, int code) { 
+int FPVout::die(string msg, int code) { 
     cerr << msg << code << endl; 
     return code; 
 }
 
-libusb_device_handle* FPVLiberator::open_device() {
+libusb_device_handle* FPVout::open_device() {
     int err = 0;
     libusb_device_handle *dh = libusb_open_device_with_vid_pid(NULL, 0x2ca3, 0x001f);
     if (dh) {
@@ -168,14 +168,14 @@ libusb_device_handle* FPVLiberator::open_device() {
     return dh;
 }
 
-void FPVLiberator::close_device(libusb_device_handle* dh) {
+void FPVout::close_device(libusb_device_handle* dh) {
     if (dh) {
         libusb_release_interface(dh, 3);
         libusb_close(dh);
     }
 }
 
-void FPVLiberator::transfer_cb(struct libusb_transfer *xfer) {
+void FPVout::transfer_cb(struct libusb_transfer *xfer) {
     ctx* c = (ctx*) xfer->user_data;
     
     if (xfer->status != LIBUSB_TRANSFER_COMPLETED) {
@@ -185,7 +185,7 @@ void FPVLiberator::transfer_cb(struct libusb_transfer *xfer) {
 
     c->last_packet = chrono::steady_clock::now();
 
-    FPVLiberator* liberator = static_cast<FPVLiberator*>(c->decoder_ctx->c->opaque);
+    FPVout* liberator = static_cast<FPVout*>(c->decoder_ctx->c->opaque);
     liberator->decode(c->decoder_ctx, xfer->buffer, xfer->actual_length);
 
     if (c->shm_offset + xfer->actual_length > SHM_SIZE) {
@@ -206,7 +206,7 @@ void FPVLiberator::transfer_cb(struct libusb_transfer *xfer) {
     }
 }
 
-int FPVLiberator::run() {
+int FPVout::run() {
     while(1) {
         if (!dh) {
             cerr << "Opening device" << endl;

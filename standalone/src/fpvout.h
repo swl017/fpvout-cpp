@@ -32,7 +32,7 @@ using namespace cv;
 #define MAX_RETRIES 5
 #define INBUF_SIZE 4096
 
-class FPVLiberator {
+class FPVout {
 private:
     struct DecoderContext {
         const AVCodec *codec;
@@ -69,7 +69,9 @@ private:
     static void transfer_cb(struct libusb_transfer *xfer);
 
 public:
-    FPVLiberator();
-    ~FPVLiberator();
+    FPVout(int width, int height);
+    ~FPVout();
     int run();
+    int width_;
+    int height_;
 };
