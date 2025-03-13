@@ -30,9 +30,5 @@ make
 - Execute
 ```
 cd standalone/build
-sudo ./fpvLiberator_shm
-```
-- Pipe version
-```
-./fpvLiberator | ffplay -i - -analyzeduration 1 -probesize 32 -sync ext
+sudo ./fpvout_example
 ```
